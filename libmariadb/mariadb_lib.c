@@ -2440,9 +2440,16 @@ int ma_read_ok_packet(MYSQL *mysql, uchar *pos, ulong length)
 {
   uchar *end= mysql->net.read_pos+length;
   size_t item_len;
+  unsigned int last_server_status= mysql->server_status;
   mysql->affected_rows= net_field_length_ll(&pos);
   mysql->insert_id=	  net_field_length_ll(&pos);
   mysql->server_status=uint2korr(pos);
+
+  /* callback */
+  if (mysql->options.extension->status_callback &&
+      mysql->server_status != last_server_status)
+    mysql->options.extension->status_callback(mysql->options.extension->status_data,
+                                              STATUS_TYPE, mysql->server_status);
   pos+=2;
   mysql->warning_count=uint2korr(pos);
   pos+=2;
@@ -2484,6 +2491,7 @@ int ma_read_ok_packet(MYSQL *mysql, uchar *pos, ulong length)
           {
             size_t plen;
             char *data;
+            MYSQL_LEX_STRING data1, data2;
             si_type= (enum enum_session_state_type)net_field_length(&pos);
 
             switch(si_type) {
@@ -2505,55 +2513,78 @@ int ma_read_ok_packet(MYSQL *mysql, uchar *pos, ulong length)
               plen= net_field_length(&pos);
               if (pos + plen > end)
                 goto corrupted;
-              if (!(session_item= ma_multi_malloc(0,
-                                  &session_item, sizeof(LIST),
-                                  &str, sizeof(MYSQL_LEX_STRING),
-                                  &data, plen,
-                                  NULL)))
-                  goto oom;
-              str->length= plen;
-              str->str= data;
-              memcpy(str->str, (char *)pos, plen);
-              pos+= plen;
-              session_item->data= str;
-              mysql->extension->session_state[si_type].list= list_add(mysql->extension->session_state[si_type].list, session_item);
 
+              if (mysql->options.extension->status_callback)
+              {
+                 data1.str= data= (char *)pos;
+                 data1.length= plen;
+ 
+                 if (si_type != SESSION_TRACK_SYSTEM_VARIABLES)
+                   mysql->options.extension->status_callback(mysql->options.extension->status_data,
+                                                             SESSION_TRACK_TYPE, si_type,
+                                                             &data1);
+              } else {
+                if (!(session_item= ma_multi_malloc(0,
+                                    &session_item, sizeof(LIST),
+                                    &str, sizeof(MYSQL_LEX_STRING),
+                                    &data, plen,
+                                    NULL)))
+                    goto oom;
+                str->length= plen;
+                str->str= data;
+                memcpy(str->str, (char *)pos, plen);
+                session_item->data= str;
+                mysql->extension->session_state[si_type].list= list_add(mysql->extension->session_state[si_type].list, session_item);
+
+              }
+              pos+= plen;
               /* in case schema has changed, we have to update mysql->db */
               if (si_type == SESSION_TRACK_SCHEMA)
               {
                 free(mysql->db);
                 mysql->db= malloc(plen + 1);
-                memcpy(mysql->db, str->str, plen);
+                memcpy(mysql->db, data, plen);
                 mysql->db[plen]= 0;
               }
               else if (si_type == SESSION_TRACK_SYSTEM_VARIABLES)
               {
                 my_bool set_charset= 0;
                 /* make sure that we update charset in case it has changed */
-                if (!strncmp(str->str, "character_set_client", str->length))
+                if (!strncmp(data, "character_set_client", plen))
                   set_charset= 1;
                 plen= net_field_length(&pos);
                 if (pos + plen > end)
                   goto corrupted;
-                if (!(session_item= ma_multi_malloc(0,
-                                    &session_item, sizeof(LIST),
-                                    &str, sizeof(MYSQL_LEX_STRING),
-                                    &data, plen,
-                                    NULL)))
-                  goto oom;
-                str->length= plen;
-                str->str= data;
-                memcpy(str->str, (char *)pos, plen);
+                if (mysql->options.extension->status_callback)
+                {
+                   data2.str= (char *)pos;
+                   data2.length= plen;
+   
+                   mysql->options.extension->status_callback(mysql->options.extension->status_data,
+                                                             SESSION_TRACK_TYPE, si_type,
+                                                             &data1, &data2);
+                } else {
+
+                  if (!(session_item= ma_multi_malloc(0,
+                                      &session_item, sizeof(LIST),
+                                      &str, sizeof(MYSQL_LEX_STRING),
+                                      &data, plen,
+                                      NULL)))
+                    goto oom;
+                  str->length= plen;
+                  str->str= data;
+                  memcpy(str->str, (char *)pos, plen);
+                  session_item->data= str;
+                  mysql->extension->session_state[si_type].list= list_add(mysql->extension->session_state[si_type].list, session_item);
+                }
                 pos+= plen;
-                session_item->data= str;
-                mysql->extension->session_state[si_type].list= list_add(mysql->extension->session_state[si_type].list, session_item);
-                if (set_charset && str->length < CHARSET_NAME_LEN &&
-                    strncmp(mysql->charset->csname, str->str, str->length) != 0)
+                if (set_charset && plen < CHARSET_NAME_LEN &&
+                    strncmp(mysql->charset->csname, data, plen) != 0)
                 {
                   char cs_name[CHARSET_NAME_LEN];
                   const MARIADB_CHARSET_INFO *cs_info;
-                  memcpy(cs_name, str->str, str->length);
-                  cs_name[str->length]= 0;
+                  memcpy(cs_name, data, plen);
+                  cs_name[plen]= 0;
                   if ((cs_info = mysql_find_charset_name(cs_name)))
                     mysql->charset= cs_info;
                 }
@@ -3661,6 +3692,13 @@ mysql_optionsv(MYSQL *mysql,enum mysql_option option, ...)
       unsigned int arg2 = va_arg(ap, unsigned int);
       OPT_SET_EXTENDED_VALUE_STR(&mysql->options, rpl_host,(char *)arg1);
       OPT_SET_EXTENDED_VALUE(&mysql->options, rpl_port, (ushort)arg2);
+    }
+    break;
+  case MARIADB_OPT_STATUS_CALLBACK:
+    {
+      void *arg2= va_arg(ap, void *);
+      OPT_SET_EXTENDED_VALUE(&mysql->options, status_callback, arg1);
+      OPT_SET_EXTENDED_VALUE(&mysql->options, status_data, arg2);
     }
     break;
   default:
